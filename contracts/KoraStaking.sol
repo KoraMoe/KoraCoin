@@ -29,6 +29,7 @@ contract KoraStaking is
         uint64 stakedAt;          // When the stake was created (8 bytes)
         uint64 unstakeRequestedAt;// When unstake was requested (8 bytes)
         uint32 arrayIndex;        // Index in the stakers array for O(1) removal (4 bytes)
+        uint256 pubCommitment;    // VRF public commitment
     }
     
     // Immutable and constant variables
@@ -40,7 +41,10 @@ contract KoraStaking is
     mapping(address => StakeInfo) public stakes;
     address[] private stakers;
     mapping(address => bool) public isStaker;
-
+    
+    // New optimization variables
+    uint256 public totalStakedAmount;  // Total amount staked by all validators
+    
     // Maximum number of stakers (uint32 max)
     uint256 private constant MAX_STAKERS = 2000000;
 
@@ -48,7 +52,7 @@ contract KoraStaking is
     uint256[100] private __gap;
     
     // Events
-    event Staked(address indexed staker, uint128 amount);
+    event Staked(address indexed staker, uint128 amount, uint256 pubCommitment);
     event UnstakeRequested(address indexed staker, uint64 requestedAt);
     event Unstaked(address indexed staker, uint128 amount);
     event MinimumStakeChanged(uint128 newMinimumStake);
@@ -84,17 +88,20 @@ contract KoraStaking is
         koraToken = IERC20(_koraToken);
         minimumStake = _minimumStake;
         unstakingDelay = _unstakingDelay;
+        totalStakedAmount = 0;
     }
 
     /**
      * @dev Stake tokens
      * @param amount Amount of tokens to stake
+     * @param pubCommitment VRF public commitment (PUB)
      */
-    function stake(uint128 amount) external nonReentrant whenNotPaused {
+    function stake(uint128 amount, uint256 pubCommitment) external nonReentrant whenNotPaused {
         require(amount >= minimumStake, "Amount below minimum stake");
         require(!isStaker[msg.sender], "Already staking");
         require(stakes[msg.sender].amount == 0, "Previous stake still exists");
         require(stakers.length < MAX_STAKERS, "Max stakers limit reached");
+        require(pubCommitment != 0, "Public commitment cannot be zero");
         
         // Transfer tokens from sender to this contract
         koraToken.safeTransferFrom(msg.sender, address(this), amount);
@@ -111,12 +118,16 @@ contract KoraStaking is
             amount: amount,
             stakedAt: currentTime,
             unstakeRequestedAt: 0,
-            arrayIndex: newIndex
+            arrayIndex: newIndex,
+            pubCommitment: pubCommitment
         });
         
         isStaker[msg.sender] = true;
         
-        emit Staked(msg.sender, amount);
+        // Update total staked amount
+        totalStakedAmount += amount;
+        
+        emit Staked(msg.sender, amount, pubCommitment);
     }
 
     /**
@@ -135,6 +146,9 @@ contract KoraStaking is
         
         // Update stake amount
         stakeInfo.amount += additionalAmount;
+        
+        // Update total staked amount
+        totalStakedAmount += additionalAmount;
         
         emit StakeIncreased(msg.sender, additionalAmount, stakeInfo.amount);
     }
@@ -160,6 +174,9 @@ contract KoraStaking is
         // Remove from stakers list using O(1) swap and pop
         _removeStaker(msg.sender, indexToRemove);
         
+        // Update total staked amount (but leave the actual tokens until unstake is complete)
+        totalStakedAmount -= stakeInfo.amount;
+        
         emit UnstakeRequested(msg.sender, currentTime);
     }
 
@@ -183,6 +200,35 @@ contract KoraStaking is
         delete stakes[msg.sender];
         
         emit Unstaked(msg.sender, amountToUnstake);
+    }
+
+    /**
+     * @dev Slash a portion of a validator's stake
+     * @param validator The address of the validator to slash
+     * @param slashPercentage The percentage to slash (in basis points, e.g. 1000 = 10%)
+     * @return The amount slashed
+     * @notice Only callable by approved consensus contracts
+     */
+    function slashValidator(address validator, uint256 slashPercentage) external whenNotPaused returns (uint256) {
+        // TODO: Add access control - only approved consensus contracts
+        require(isStaker[validator], "Not an active staker");
+        require(slashPercentage > 0 && slashPercentage <= 10000, "Invalid slash percentage");
+        
+        StakeInfo storage stakeInfo = stakes[validator];
+        require(stakeInfo.amount > 0, "No stake to slash");
+        
+        // Calculate slash amount
+        uint256 slashAmount = (uint256(stakeInfo.amount) * slashPercentage) / 10000;
+        uint128 remainingAmount = stakeInfo.amount - uint128(slashAmount);
+        
+        // Update stake amount
+        stakeInfo.amount = remainingAmount;
+        
+        // Update total staked amount
+        totalStakedAmount -= uint128(slashAmount);
+        
+        // Return slashed amount - the contract calling this can decide what to do with it
+        return slashAmount;
     }
 
     /**
@@ -244,20 +290,72 @@ contract KoraStaking is
      * @return stakedAt The timestamp when tokens were staked
      * @return unstakeRequestedAt The timestamp when unstake was requested (0 if not requested)
      * @return isActive Whether the stake is active
+     * @return pubCommitment The VRF public commitment
      */
     function getStakeInfo(address staker) external view returns (
         uint128 amount,
         uint64 stakedAt,
         uint64 unstakeRequestedAt,
-        bool isActive
+        bool isActive,
+        uint256 pubCommitment
     ) {
         StakeInfo storage info = stakes[staker];
         return (
             info.amount,
             info.stakedAt,
             info.unstakeRequestedAt,
-            isStaker[staker]
+            isStaker[staker],
+            info.pubCommitment
         );
+    }
+    
+    /**
+     * @dev Get the public commitment of a validator
+     * @param validator Address of the validator
+     * @return The validator's public commitment
+     */
+    function getValidatorPublicCommitment(address validator) external view returns (uint256) {
+        StakeInfo storage info = stakes[validator];
+        require(isStaker[validator], "Not an active staker");
+        require(info.pubCommitment != 0, "No public commitment found");
+        return info.pubCommitment;
+    }
+
+    /**
+     * @dev Select a random validator based on stake weight
+     * @param randomSeed A random seed to use for selection
+     * @return The selected validator address
+     */
+    function selectRandomValidator(uint256 randomSeed) external view returns (address) {
+        require(stakers.length > 0, "No active stakers");
+        require(totalStakedAmount > 0, "No active stake");
+        
+        // Use the seed to get a random value between 0 and totalStakedAmount
+        uint256 randomValue = uint256(keccak256(abi.encodePacked(randomSeed))) % totalStakedAmount;
+        
+        // Select the validator based on stake weight in a single pass
+        address selectedValidator;
+        uint256 cumulativeStake = 0;
+        
+        for (uint256 i = 0; i < stakers.length; i++) {
+            address staker = stakers[i];
+            
+            if (isStaker[staker]) {
+                cumulativeStake += stakes[staker].amount;
+                if (cumulativeStake > randomValue) {
+                    selectedValidator = staker;
+                    break;
+                }
+            }
+        }
+        
+        // If somehow we reached the end without selecting (unlikely due to totalStakedAmount check)
+        // then just pick the last staker as a fallback
+        if (selectedValidator == address(0) && stakers.length > 0) {
+            selectedValidator = stakers[stakers.length - 1];
+        }
+        
+        return selectedValidator;
     }
 
     /**
